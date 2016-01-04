@@ -1,0 +1,1589 @@
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.cc	2016-01-04 11:02:00.313191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.cc	2016-01-04 10:57:31.501191080 -0600
+@@ -26,6 +26,7 @@
+ #include "ns3/string.h"
+ #include "ns3/pointer.h"
+ #include "ns3/boolean.h"
++#include "ns3/enum.h"
+ #include "ns3/trace-source-accessor.h"
+ #include "qos-tag.h"
+ #include "mac-low.h"
+@@ -59,6 +60,48 @@ namespace ns3 {
+ 
+ NS_LOG_COMPONENT_DEFINE ("StaWifiMac");
+ 
++ class PhyStaMacListener : public ns3::WifiPhyListener
++ {
++ public:
++   PhyStaMacListener (ns3::StaWifiMac *staMac)
++     : m_staMac (staMac)
++   {
++   }
++   virtual ~PhyStaMacListener ()
++   {
++   }
++   virtual void NotifyRxStart (Time duration)
++   {
++   }
++   virtual void NotifyRxEndOk (void)
++   {
++   }
++   virtual void NotifyRxEndError (void)
++   {
++   }
++   virtual void NotifyTxStart (Time duration)
++   {
++   }
++   virtual void NotifyTxStart (Time duration, double txPowerDbm)
++   {
++   }
++   virtual void NotifySleep (void){
++   }
++   virtual void NotifyWakeup (void){
++   }
++   virtual void NotifyMaybeCcaBusyStart (Time duration)
++   {
++     m_staMac->NotifyCcaBusyOccurred ();
++   }
++   virtual void NotifySwitchingStart (Time duration)
++   {
++     m_staMac->NotifySwitchingStartNow (duration);
++   }
++ private:
++   ns3::StaWifiMac *m_staMac;
++ };
++ 
++
+ NS_OBJECT_ENSURE_REGISTERED (StaWifiMac);
+ 
+ TypeId
+@@ -91,6 +134,28 @@ StaWifiMac::GetTypeId (void)
+                    BooleanValue (false),
+                    MakeBooleanAccessor (&StaWifiMac::SetActiveProbing, &StaWifiMac::GetActiveProbing),
+                    MakeBooleanChecker ())
++     .AddAttribute ("ScanType",
++                    "The type of scanning for a BSS.",
++                    EnumValue (NOTSUPPORT),
++                    MakeEnumAccessor (&StaWifiMac::m_scanType), 
++                    MakeEnumChecker (NOTSUPPORT, "NotSupport",
++                             ACTIVE, "Active",
++                                     PASSIVE, "Passive"))
++     .AddAttribute ("MaxScanningChannelNumber",
++                    "Specifies maximum number of channels that are examined when scanning for a BSS.",
++                    UintegerValue (11),
++                    MakeUintegerAccessor (&StaWifiMac::m_maxChannelNumber), 
++                    MakeUintegerChecker<uint16_t> ())
++     .AddAttribute ("MaxChannelTime",
++                    "The maximum time to spend on each channel when scanning.",
++                    TimeValue (Seconds (0.05)),
++                    MakeTimeAccessor (&StaWifiMac::m_maxChannelTime), 
++                    MakeTimeChecker ())
++     .AddAttribute ("MinChannelTime",
++                    "The minimum time to spend on each channel when scanning.",
++                    TimeValue (Seconds (0.02)),
++                    MakeTimeAccessor (&StaWifiMac::m_minChannelTime), 
++                    MakeTimeChecker ())                   
+     .AddTraceSource ("Assoc", "Associated with an access point.",
+                      MakeTraceSourceAccessor (&StaWifiMac::m_assocLogger),
+                      "ns3::Mac48Address::TracedCallback")
+@@ -105,9 +170,20 @@ StaWifiMac::StaWifiMac ()
+   : m_state (BEACON_MISSED),
+     m_probeRequestEvent (),
+     m_assocRequestEvent (),
+-    m_beaconWatchdogEnd (Seconds (0.0))
++    m_beaconWatchdogEnd (Seconds (0.0)),
++    m_scanType (NOTSUPPORT),
++    m_maxChannelTime (Seconds (0.0)),
++    m_minChannelTime (Seconds (0.0)),
++    m_maxChannelNumber (0),
++    m_scanChannelNumber (0),
++    m_bCcaBusyOccurred (false),
++    m_scanResults (std::vector<ScanningEntry> ())    
+ {
+   NS_LOG_FUNCTION (this);
++  
++  m_rxMiddle->SetForwardSnrCallback (MakeCallback (&StaWifiMac::SnrReceive, this));
++  m_low->SetSnrRxCallback (MakeCallback (&MacRxMiddle::SnrReceive, m_rxMiddle));
++
+ 
+   //Let the lower layers know that we are acting as a non-AP STA in
+   //an infrastructure BSS.
+@@ -119,6 +195,22 @@ StaWifiMac::~StaWifiMac ()
+   NS_LOG_FUNCTION (this);
+ }
+ 
++
++  void
++ StaWifiMac::SetWifiPhy (Ptr<WifiPhy> phy)
++ {
++   RegularWifiMac::SetWifiPhy (phy);
++   SetupStaMacListener (phy);
++ }
++ 
++ void
++ StaWifiMac::DoDispose ()
++ {
++   RegularWifiMac::DoDispose ();
++   delete m_phyStaMacListener;
++   m_phyStaMacListener = NULL;
++ }
++ 
+ void
+ StaWifiMac::SetMaxMissedBeacons (uint32_t missed)
+ {
+@@ -289,6 +381,8 @@ StaWifiMac::TryToEnsureAssociated (void)
+          association with a given ssid.
+        */
+       break;
++    case SCANNING:
++      break;
+     }
+ }
+ 
+@@ -308,6 +402,29 @@ StaWifiMac::ProbeRequestTimeout (void)
+   SendProbeRequest ();
+ }
+ 
++ void
++ StaWifiMac::RunScanOrProbe (void)
++ {
++     NS_LOG_FUNCTION (this << GetBssid ());
++     if (IsSupportScanning())
++       {
++         if (m_state != SCANNING)
++         {
++           NS_LOG_DEBUG ("start scanning");
++           SetState (SCANNING);
++           ScanningStart ();
++         }
++       }
++     else
++       {
++         NS_LOG_DEBUG ("beacon missed");
++         SetState (BEACON_MISSED);
++         TryToEnsureAssociated ();
++       } 
++ }
++
++
++
+ void
+ StaWifiMac::MissedBeacons (void)
+ {
+@@ -322,9 +439,10 @@ StaWifiMac::MissedBeacons (void)
+                                               &StaWifiMac::MissedBeacons, this);
+       return;
+     }
+-  NS_LOG_DEBUG ("beacon missed");
+-  SetState (BEACON_MISSED);
+-  TryToEnsureAssociated ();
++//  NS_LOG_DEBUG ("beacon missed");
++//  SetState (BEACON_MISSED);
++//  TryToEnsureAssociated ();
++  RunScanOrProbe();
+ }
+ 
+ void
+@@ -359,7 +477,8 @@ StaWifiMac::Enqueue (Ptr<const Packet> p
+   if (!IsAssociated ())
+     {
+       NotifyTxDrop (packet);
+-      TryToEnsureAssociated ();
++//      TryToEnsureAssociated ();
++	  RunScanOrProbe();
+       return;
+     }
+   WifiMacHeader hdr;
+@@ -763,4 +882,183 @@ StaWifiMac::SetState (MacState value)
+   m_state = value;
+ }
+ 
++
++ void
++ StaWifiMac::SetupStaMacListener (Ptr<WifiPhy> phy)
++ {
++   m_phyStaMacListener = new PhyStaMacListener (this);
++   phy->RegisterListener (m_phyStaMacListener);
++ }
++ 
++ bool 
++ StaWifiMac::IsSupportScanning (void) const
++ {
++   return m_scanType != NOTSUPPORT;
++ }
++ 
++ void 
++ StaWifiMac::NotifySwitchingStartNow (Time duration)
++ {
++   Simulator::Schedule (duration,
++                        &StaWifiMac::ScanningSwitchChannelEnd, this);
++ }
++ 
++ void 
++ StaWifiMac:: NotifyCcaBusyOccurred ()
++ {
++   m_bCcaBusyOccurred = true;
++ }
++ 
++ void 
++ StaWifiMac::ScanningStart(void)
++ {
++   NS_LOG_FUNCTION (this);
++   m_probeRequestEvent.Cancel ();
++   m_beaconWatchdog.Cancel ();
++   m_scanChannelNumber = 0;
++   m_scanResults.clear ();
++   m_low->EnableForwardSnr (true);
++   m_bestAP = NULL;
++   Simulator::ScheduleNow (&StaWifiMac::ScanningSwitchChannelStart, this);
++ }
++ 
++ void 
++ StaWifiMac::ScanningEnd(void)
++ {
++   NS_LOG_FUNCTION (this);
++   m_low->EnableForwardSnr (false);
++ 
++   SetState (BEACON_MISSED);
++ 
++   uint32_t size = m_scanResults.size ();
++   if (size == 0)
++     {
++       NS_LOG_LOGIC ("cant scan for any ap.");
++       RunScanOrProbe ();
++     } 
++   else
++     {
++       NS_LOG_DEBUG ("scan result: number of aps is " << m_scanResults.size ());
++       m_bestAP = &m_scanResults[0];
++     
++      for (uint32_t i = 1; i < size; i++)
++        {
++          if (m_bestAP->rxSnr < m_scanResults[i].rxSnr)
++            {
++              m_bestAP = &m_scanResults[i];
++             }  
++         }
++       NS_LOG_DEBUG ("bestAP: " << m_bestAP->channelNumber << " " << m_bestAP->ssid << " " << m_bestAP->bssid);
++       m_phy->SetChannelNumber (m_bestAP->channelNumber);
++     }  
++ }
++ 
++ void
++ StaWifiMac::ScanningSwitchChannelStart(void)
++ {  
++   if (m_probeRequestEvent.IsRunning ())
++     {
++       m_probeRequestEvent.Cancel ();
++     }
++       
++   m_scanChannelNumber++;
++   NS_LOG_DEBUG ("switch to channel number:" << m_scanChannelNumber);
++   if(m_scanChannelNumber > m_maxChannelNumber)
++     {
++       ScanningEnd();
++     }
++   else
++     {
++       m_phy->SetChannelNumber (m_scanChannelNumber);
++     }
++ }
++ 
++ void
++ StaWifiMac::ScanningSwitchChannelEnd(void)
++ {
++     if (m_bestAP == NULL)
++       {
++         m_bCcaBusyOccurred = m_phy->IsStateCcaBusy ();
++   
++         if (m_scanType == ACTIVE)
++           {
++             SetSsid(Ssid());
++             SendProbeRequest();
++             m_scanChannelEvent = Simulator::Schedule (m_minChannelTime,
++                                  &StaWifiMac::ScanningMinChannelTimeout, this);
++           }
++         else if (m_scanType == PASSIVE)
++           {
++             m_scanChannelEvent = Simulator::Schedule (m_maxChannelTime,
++                                  &StaWifiMac::ScanningSwitchChannelStart, this);
++           }
++       }
++     else
++       {
++         SetSsid (m_bestAP->ssid);
++         SetState (WAIT_PROBE_RESP);
++         SendProbeRequest();          
++       } 
++ }
++ 
++ void 
++ StaWifiMac::ScanningMinChannelTimeout(void)
++ {
++   if (m_bCcaBusyOccurred && m_maxChannelTime > m_minChannelTime)
++     {
++       m_scanChannelEvent = Simulator::Schedule (m_maxChannelTime - m_minChannelTime,
++                            &StaWifiMac::ScanningSwitchChannelStart, this);
++     }
++   else
++     {
++       Simulator::ScheduleNow (&StaWifiMac::ScanningSwitchChannelStart, this);
++     }
++ }
++ 
++ void 
++ StaWifiMac::SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr)
++ {
++   NS_LOG_FUNCTION (this << packet << hdr << rxSnr << GetAddress () << hdr->GetAddr3 () << hdr->GetAddr1 ());
++   NS_ASSERT (!hdr->IsCtl ());
++   
++   ScanningEntry entry;
++   if (hdr->GetAddr3 () == GetAddress ())
++     {
++       NS_LOG_LOGIC ("packet sent by us.");
++       return;
++     }
++   else if (hdr->GetAddr1 () != GetAddress ())
++     {
++       NS_LOG_LOGIC ("packet is not for us");
++       NotifyRxDrop (packet);
++       return;
++     }
++    else if (hdr->IsBeacon ())
++     {
++       MgtBeaconHeader beacon;
++       packet->RemoveHeader (beacon);
++       
++       entry.ssid = beacon.GetSsid ();
++       
++     }
++   else if (hdr->IsProbeResp ())
++     {    
++         MgtProbeResponseHeader probeResp;
++         packet->RemoveHeader (probeResp);
++         
++         entry.ssid = probeResp.GetSsid ();        
++     }
++   else
++     {
++       NotifyRxDrop (packet);
++       return;
++     }
++     
++   entry.channelNumber = m_scanChannelNumber;
++   entry.bssid = hdr->GetAddr3 ();
++   entry.rxSnr = rxSnr;
++   m_scanResults.push_back (entry);
++ }
++ 
++
+ } //namespace ns3
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.h	2016-01-04 11:02:00.317191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.h	2016-01-04 10:37:20.353191080 -0600
+@@ -42,6 +42,27 @@ class MgtAddBaRequestHeader;
+ class StaWifiMac : public RegularWifiMac
+ {
+ public:
++
++
++   enum MacScanType
++   {
++     NOTSUPPORT,
++     ACTIVE,
++     PASSIVE
++   };
++ 
++   struct ScanningEntry
++   {
++     uint16_t channelNumber;
++     Ssid ssid;
++     Mac48Address bssid;
++     double rxSnr;
++   };
++   typedef Callback<void, std::vector<ScanningEntry> const & > ScanningCallback;
++ 
++
++
++
+   static TypeId GetTypeId (void);
+ 
+   StaWifiMac ();
+@@ -56,6 +77,11 @@ public:
+    * access is granted to this MAC.
+    */
+   virtual void Enqueue (Ptr<const Packet> packet, Mac48Address to);
++  
++  /**
++   * \param phy the physical layer attached to this MAC.
++   */
++  virtual void SetWifiPhy (Ptr<WifiPhy> phy);
+ 
+   /**
+    * \param missed the number of beacons which must be missed
+@@ -82,6 +108,23 @@ public:
+    */
+   void StartActiveAssociation (void);
+ 
++  /**
++   * \param duration switching delay duration.
++   *
++   * This method is typically invoked by the PhyMacLowListener to notify
++   * the MAC layer that a channel switching occured. When a channel switching
++   * occurs, pending MAC transmissions (RTS, CTS, DATA and ACK) are cancelled.
++   */
++  void NotifySwitchingStartNow (Time duration);
++  /**
++   * This method is typically invoked by the PhyMacLowListener to notify
++   * the MAC layer that CCA(Clear Channel Assessment) becomes busy
++   */
++  void NotifyCcaBusyOccurred ();
++
++protected:  
++  virtual void DoDispose ();
++
+ 
+ private:
+   /**
+@@ -93,7 +136,8 @@ private:
+     WAIT_PROBE_RESP,
+     WAIT_ASSOC_RESP,
+     BEACON_MISSED,
+-    REFUSED
++    REFUSED,
++    SCANNING
+   };
+ 
+   /**
+@@ -183,6 +227,20 @@ private:
+    * \return the HT capability that we support
+    */
+   HtCapabilities GetHtCapabilities (void) const;
++  
++  void SetupStaMacListener (Ptr<WifiPhy> phy);
++  bool IsSupportScanning (void) const;
++  void ScanningStart (void);
++  void ScanningEnd (void);
++  void ScanningSwitchChannelStart (void);
++  void ScanningSwitchChannelEnd (void);
++  void ScanningMinChannelTimeout (void);
++  virtual void SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr);
++  void RunScanOrProbe (void);
++  
++  
++  
++  
+   /**
+    * Return the VHT capability of the current STA.
+    *
+@@ -200,6 +258,20 @@ private:
+   uint32_t m_maxMissedBeacons;
+   bool m_activeProbing;
+ 
++  class PhyStaMacListener * m_phyStaMacListener;
++  MacScanType m_scanType;
++  Time m_maxChannelTime;
++  Time m_minChannelTime;
++  uint16_t m_maxChannelNumber;
++  uint16_t m_scanChannelNumber;
++  bool m_bCcaBusyOccurred;
++  std::vector<ScanningEntry> m_scanResults;
++  EventId m_scanChannelEvent;
++  ScanningEntry* m_bestAP;
++
++
++
++
+   TracedCallback<Mac48Address> m_assocLogger;
+   TracedCallback<Mac48Address> m_deAssocLogger;
+ };
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.cc	2016-01-04 11:02:00.313191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.cc	2016-01-04 10:57:31.501191080 -0600
+@@ -26,6 +26,7 @@
+ #include "ns3/string.h"
+ #include "ns3/pointer.h"
+ #include "ns3/boolean.h"
++#include "ns3/enum.h"
+ #include "ns3/trace-source-accessor.h"
+ #include "qos-tag.h"
+ #include "mac-low.h"
+@@ -59,6 +60,48 @@ namespace ns3 {
+ 
+ NS_LOG_COMPONENT_DEFINE ("StaWifiMac");
+ 
++ class PhyStaMacListener : public ns3::WifiPhyListener
++ {
++ public:
++   PhyStaMacListener (ns3::StaWifiMac *staMac)
++     : m_staMac (staMac)
++   {
++   }
++   virtual ~PhyStaMacListener ()
++   {
++   }
++   virtual void NotifyRxStart (Time duration)
++   {
++   }
++   virtual void NotifyRxEndOk (void)
++   {
++   }
++   virtual void NotifyRxEndError (void)
++   {
++   }
++   virtual void NotifyTxStart (Time duration)
++   {
++   }
++   virtual void NotifyTxStart (Time duration, double txPowerDbm)
++   {
++   }
++   virtual void NotifySleep (void){
++   }
++   virtual void NotifyWakeup (void){
++   }
++   virtual void NotifyMaybeCcaBusyStart (Time duration)
++   {
++     m_staMac->NotifyCcaBusyOccurred ();
++   }
++   virtual void NotifySwitchingStart (Time duration)
++   {
++     m_staMac->NotifySwitchingStartNow (duration);
++   }
++ private:
++   ns3::StaWifiMac *m_staMac;
++ };
++ 
++
+ NS_OBJECT_ENSURE_REGISTERED (StaWifiMac);
+ 
+ TypeId
+@@ -91,6 +134,28 @@ StaWifiMac::GetTypeId (void)
+                    BooleanValue (false),
+                    MakeBooleanAccessor (&StaWifiMac::SetActiveProbing, &StaWifiMac::GetActiveProbing),
+                    MakeBooleanChecker ())
++     .AddAttribute ("ScanType",
++                    "The type of scanning for a BSS.",
++                    EnumValue (NOTSUPPORT),
++                    MakeEnumAccessor (&StaWifiMac::m_scanType), 
++                    MakeEnumChecker (NOTSUPPORT, "NotSupport",
++                             ACTIVE, "Active",
++                                     PASSIVE, "Passive"))
++     .AddAttribute ("MaxScanningChannelNumber",
++                    "Specifies maximum number of channels that are examined when scanning for a BSS.",
++                    UintegerValue (11),
++                    MakeUintegerAccessor (&StaWifiMac::m_maxChannelNumber), 
++                    MakeUintegerChecker<uint16_t> ())
++     .AddAttribute ("MaxChannelTime",
++                    "The maximum time to spend on each channel when scanning.",
++                    TimeValue (Seconds (0.05)),
++                    MakeTimeAccessor (&StaWifiMac::m_maxChannelTime), 
++                    MakeTimeChecker ())
++     .AddAttribute ("MinChannelTime",
++                    "The minimum time to spend on each channel when scanning.",
++                    TimeValue (Seconds (0.02)),
++                    MakeTimeAccessor (&StaWifiMac::m_minChannelTime), 
++                    MakeTimeChecker ())                   
+     .AddTraceSource ("Assoc", "Associated with an access point.",
+                      MakeTraceSourceAccessor (&StaWifiMac::m_assocLogger),
+                      "ns3::Mac48Address::TracedCallback")
+@@ -105,9 +170,20 @@ StaWifiMac::StaWifiMac ()
+   : m_state (BEACON_MISSED),
+     m_probeRequestEvent (),
+     m_assocRequestEvent (),
+-    m_beaconWatchdogEnd (Seconds (0.0))
++    m_beaconWatchdogEnd (Seconds (0.0)),
++    m_scanType (NOTSUPPORT),
++    m_maxChannelTime (Seconds (0.0)),
++    m_minChannelTime (Seconds (0.0)),
++    m_maxChannelNumber (0),
++    m_scanChannelNumber (0),
++    m_bCcaBusyOccurred (false),
++    m_scanResults (std::vector<ScanningEntry> ())    
+ {
+   NS_LOG_FUNCTION (this);
++  
++  m_rxMiddle->SetForwardSnrCallback (MakeCallback (&StaWifiMac::SnrReceive, this));
++  m_low->SetSnrRxCallback (MakeCallback (&MacRxMiddle::SnrReceive, m_rxMiddle));
++
+ 
+   //Let the lower layers know that we are acting as a non-AP STA in
+   //an infrastructure BSS.
+@@ -119,6 +195,22 @@ StaWifiMac::~StaWifiMac ()
+   NS_LOG_FUNCTION (this);
+ }
+ 
++
++  void
++ StaWifiMac::SetWifiPhy (Ptr<WifiPhy> phy)
++ {
++   RegularWifiMac::SetWifiPhy (phy);
++   SetupStaMacListener (phy);
++ }
++ 
++ void
++ StaWifiMac::DoDispose ()
++ {
++   RegularWifiMac::DoDispose ();
++   delete m_phyStaMacListener;
++   m_phyStaMacListener = NULL;
++ }
++ 
+ void
+ StaWifiMac::SetMaxMissedBeacons (uint32_t missed)
+ {
+@@ -289,6 +381,8 @@ StaWifiMac::TryToEnsureAssociated (void)
+          association with a given ssid.
+        */
+       break;
++    case SCANNING:
++      break;
+     }
+ }
+ 
+@@ -308,6 +402,29 @@ StaWifiMac::ProbeRequestTimeout (void)
+   SendProbeRequest ();
+ }
+ 
++ void
++ StaWifiMac::RunScanOrProbe (void)
++ {
++     NS_LOG_FUNCTION (this << GetBssid ());
++     if (IsSupportScanning())
++       {
++         if (m_state != SCANNING)
++         {
++           NS_LOG_DEBUG ("start scanning");
++           SetState (SCANNING);
++           ScanningStart ();
++         }
++       }
++     else
++       {
++         NS_LOG_DEBUG ("beacon missed");
++         SetState (BEACON_MISSED);
++         TryToEnsureAssociated ();
++       } 
++ }
++
++
++
+ void
+ StaWifiMac::MissedBeacons (void)
+ {
+@@ -322,9 +439,10 @@ StaWifiMac::MissedBeacons (void)
+                                               &StaWifiMac::MissedBeacons, this);
+       return;
+     }
+-  NS_LOG_DEBUG ("beacon missed");
+-  SetState (BEACON_MISSED);
+-  TryToEnsureAssociated ();
++//  NS_LOG_DEBUG ("beacon missed");
++//  SetState (BEACON_MISSED);
++//  TryToEnsureAssociated ();
++  RunScanOrProbe();
+ }
+ 
+ void
+@@ -359,7 +477,8 @@ StaWifiMac::Enqueue (Ptr<const Packet> p
+   if (!IsAssociated ())
+     {
+       NotifyTxDrop (packet);
+-      TryToEnsureAssociated ();
++//      TryToEnsureAssociated ();
++	  RunScanOrProbe();
+       return;
+     }
+   WifiMacHeader hdr;
+@@ -763,4 +882,183 @@ StaWifiMac::SetState (MacState value)
+   m_state = value;
+ }
+ 
++
++ void
++ StaWifiMac::SetupStaMacListener (Ptr<WifiPhy> phy)
++ {
++   m_phyStaMacListener = new PhyStaMacListener (this);
++   phy->RegisterListener (m_phyStaMacListener);
++ }
++ 
++ bool 
++ StaWifiMac::IsSupportScanning (void) const
++ {
++   return m_scanType != NOTSUPPORT;
++ }
++ 
++ void 
++ StaWifiMac::NotifySwitchingStartNow (Time duration)
++ {
++   Simulator::Schedule (duration,
++                        &StaWifiMac::ScanningSwitchChannelEnd, this);
++ }
++ 
++ void 
++ StaWifiMac:: NotifyCcaBusyOccurred ()
++ {
++   m_bCcaBusyOccurred = true;
++ }
++ 
++ void 
++ StaWifiMac::ScanningStart(void)
++ {
++   NS_LOG_FUNCTION (this);
++   m_probeRequestEvent.Cancel ();
++   m_beaconWatchdog.Cancel ();
++   m_scanChannelNumber = 0;
++   m_scanResults.clear ();
++   m_low->EnableForwardSnr (true);
++   m_bestAP = NULL;
++   Simulator::ScheduleNow (&StaWifiMac::ScanningSwitchChannelStart, this);
++ }
++ 
++ void 
++ StaWifiMac::ScanningEnd(void)
++ {
++   NS_LOG_FUNCTION (this);
++   m_low->EnableForwardSnr (false);
++ 
++   SetState (BEACON_MISSED);
++ 
++   uint32_t size = m_scanResults.size ();
++   if (size == 0)
++     {
++       NS_LOG_LOGIC ("cant scan for any ap.");
++       RunScanOrProbe ();
++     } 
++   else
++     {
++       NS_LOG_DEBUG ("scan result: number of aps is " << m_scanResults.size ());
++       m_bestAP = &m_scanResults[0];
++     
++      for (uint32_t i = 1; i < size; i++)
++        {
++          if (m_bestAP->rxSnr < m_scanResults[i].rxSnr)
++            {
++              m_bestAP = &m_scanResults[i];
++             }  
++         }
++       NS_LOG_DEBUG ("bestAP: " << m_bestAP->channelNumber << " " << m_bestAP->ssid << " " << m_bestAP->bssid);
++       m_phy->SetChannelNumber (m_bestAP->channelNumber);
++     }  
++ }
++ 
++ void
++ StaWifiMac::ScanningSwitchChannelStart(void)
++ {  
++   if (m_probeRequestEvent.IsRunning ())
++     {
++       m_probeRequestEvent.Cancel ();
++     }
++       
++   m_scanChannelNumber++;
++   NS_LOG_DEBUG ("switch to channel number:" << m_scanChannelNumber);
++   if(m_scanChannelNumber > m_maxChannelNumber)
++     {
++       ScanningEnd();
++     }
++   else
++     {
++       m_phy->SetChannelNumber (m_scanChannelNumber);
++     }
++ }
++ 
++ void
++ StaWifiMac::ScanningSwitchChannelEnd(void)
++ {
++     if (m_bestAP == NULL)
++       {
++         m_bCcaBusyOccurred = m_phy->IsStateCcaBusy ();
++   
++         if (m_scanType == ACTIVE)
++           {
++             SetSsid(Ssid());
++             SendProbeRequest();
++             m_scanChannelEvent = Simulator::Schedule (m_minChannelTime,
++                                  &StaWifiMac::ScanningMinChannelTimeout, this);
++           }
++         else if (m_scanType == PASSIVE)
++           {
++             m_scanChannelEvent = Simulator::Schedule (m_maxChannelTime,
++                                  &StaWifiMac::ScanningSwitchChannelStart, this);
++           }
++       }
++     else
++       {
++         SetSsid (m_bestAP->ssid);
++         SetState (WAIT_PROBE_RESP);
++         SendProbeRequest();          
++       } 
++ }
++ 
++ void 
++ StaWifiMac::ScanningMinChannelTimeout(void)
++ {
++   if (m_bCcaBusyOccurred && m_maxChannelTime > m_minChannelTime)
++     {
++       m_scanChannelEvent = Simulator::Schedule (m_maxChannelTime - m_minChannelTime,
++                            &StaWifiMac::ScanningSwitchChannelStart, this);
++     }
++   else
++     {
++       Simulator::ScheduleNow (&StaWifiMac::ScanningSwitchChannelStart, this);
++     }
++ }
++ 
++ void 
++ StaWifiMac::SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr)
++ {
++   NS_LOG_FUNCTION (this << packet << hdr << rxSnr << GetAddress () << hdr->GetAddr3 () << hdr->GetAddr1 ());
++   NS_ASSERT (!hdr->IsCtl ());
++   
++   ScanningEntry entry;
++   if (hdr->GetAddr3 () == GetAddress ())
++     {
++       NS_LOG_LOGIC ("packet sent by us.");
++       return;
++     }
++   else if (hdr->GetAddr1 () != GetAddress ())
++     {
++       NS_LOG_LOGIC ("packet is not for us");
++       NotifyRxDrop (packet);
++       return;
++     }
++    else if (hdr->IsBeacon ())
++     {
++       MgtBeaconHeader beacon;
++       packet->RemoveHeader (beacon);
++       
++       entry.ssid = beacon.GetSsid ();
++       
++     }
++   else if (hdr->IsProbeResp ())
++     {    
++         MgtProbeResponseHeader probeResp;
++         packet->RemoveHeader (probeResp);
++         
++         entry.ssid = probeResp.GetSsid ();        
++     }
++   else
++     {
++       NotifyRxDrop (packet);
++       return;
++     }
++     
++   entry.channelNumber = m_scanChannelNumber;
++   entry.bssid = hdr->GetAddr3 ();
++   entry.rxSnr = rxSnr;
++   m_scanResults.push_back (entry);
++ }
++ 
++
+ } //namespace ns3
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.h	2016-01-04 11:02:00.317191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.h	2016-01-04 10:37:20.353191080 -0600
+@@ -42,6 +42,27 @@ class MgtAddBaRequestHeader;
+ class StaWifiMac : public RegularWifiMac
+ {
+ public:
++
++
++   enum MacScanType
++   {
++     NOTSUPPORT,
++     ACTIVE,
++     PASSIVE
++   };
++ 
++   struct ScanningEntry
++   {
++     uint16_t channelNumber;
++     Ssid ssid;
++     Mac48Address bssid;
++     double rxSnr;
++   };
++   typedef Callback<void, std::vector<ScanningEntry> const & > ScanningCallback;
++ 
++
++
++
+   static TypeId GetTypeId (void);
+ 
+   StaWifiMac ();
+@@ -56,6 +77,11 @@ public:
+    * access is granted to this MAC.
+    */
+   virtual void Enqueue (Ptr<const Packet> packet, Mac48Address to);
++  
++  /**
++   * \param phy the physical layer attached to this MAC.
++   */
++  virtual void SetWifiPhy (Ptr<WifiPhy> phy);
+ 
+   /**
+    * \param missed the number of beacons which must be missed
+@@ -82,6 +108,23 @@ public:
+    */
+   void StartActiveAssociation (void);
+ 
++  /**
++   * \param duration switching delay duration.
++   *
++   * This method is typically invoked by the PhyMacLowListener to notify
++   * the MAC layer that a channel switching occured. When a channel switching
++   * occurs, pending MAC transmissions (RTS, CTS, DATA and ACK) are cancelled.
++   */
++  void NotifySwitchingStartNow (Time duration);
++  /**
++   * This method is typically invoked by the PhyMacLowListener to notify
++   * the MAC layer that CCA(Clear Channel Assessment) becomes busy
++   */
++  void NotifyCcaBusyOccurred ();
++
++protected:  
++  virtual void DoDispose ();
++
+ 
+ private:
+   /**
+@@ -93,7 +136,8 @@ private:
+     WAIT_PROBE_RESP,
+     WAIT_ASSOC_RESP,
+     BEACON_MISSED,
+-    REFUSED
++    REFUSED,
++    SCANNING
+   };
+ 
+   /**
+@@ -183,6 +227,20 @@ private:
+    * \return the HT capability that we support
+    */
+   HtCapabilities GetHtCapabilities (void) const;
++  
++  void SetupStaMacListener (Ptr<WifiPhy> phy);
++  bool IsSupportScanning (void) const;
++  void ScanningStart (void);
++  void ScanningEnd (void);
++  void ScanningSwitchChannelStart (void);
++  void ScanningSwitchChannelEnd (void);
++  void ScanningMinChannelTimeout (void);
++  virtual void SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr);
++  void RunScanOrProbe (void);
++  
++  
++  
++  
+   /**
+    * Return the VHT capability of the current STA.
+    *
+@@ -200,6 +258,20 @@ private:
+   uint32_t m_maxMissedBeacons;
+   bool m_activeProbing;
+ 
++  class PhyStaMacListener * m_phyStaMacListener;
++  MacScanType m_scanType;
++  Time m_maxChannelTime;
++  Time m_minChannelTime;
++  uint16_t m_maxChannelNumber;
++  uint16_t m_scanChannelNumber;
++  bool m_bCcaBusyOccurred;
++  std::vector<ScanningEntry> m_scanResults;
++  EventId m_scanChannelEvent;
++  ScanningEntry* m_bestAP;
++
++
++
++
+   TracedCallback<Mac48Address> m_assocLogger;
+   TracedCallback<Mac48Address> m_deAssocLogger;
+ };
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/mac-rx-middle.h	2016-01-04 11:02:00.297191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/mac-rx-middle.h	2016-01-04 10:32:14.961191080 -0600
+@@ -44,6 +44,7 @@ public:
+    * typedef for callback
+    */
+   typedef Callback<void, Ptr<Packet>, const WifiMacHeader*> ForwardUpCallback;
++  typedef Callback<void, Ptr<Packet>, const WifiMacHeader*,  double> ForwardUpSnrCallback;
+ 
+   MacRxMiddle ();
+   ~MacRxMiddle ();
+@@ -54,9 +55,10 @@ public:
+    * \param callback
+    */
+   void SetForwardCallback (ForwardUpCallback callback);
++  void SetForwardSnrCallback (ForwardUpSnrCallback callback);
+ 
+   void Receive (Ptr<Packet> packet, const WifiMacHeader *hdr);
+-
++  void SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr);
+ 
+ private:
+   friend class MacRxMiddleTest;
+@@ -119,6 +121,7 @@ private:
+   Originators m_originatorStatus;
+   QosOriginators m_qosOriginatorStatus;
+   ForwardUpCallback m_callback;
++  ForwardUpSnrCallback m_snrCallback;
+ };
+ 
+ } //namespace ns3
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/mac-rx-middle.cc	2016-01-04 11:02:00.297191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/mac-rx-middle.cc	2016-01-04 10:30:32.465191080 -0600
+@@ -191,7 +191,12 @@ MacRxMiddle::SetForwardCallback (Forward
+   NS_LOG_FUNCTION_NOARGS ();
+   m_callback = callback;
+ }
+-
++void
++MacRxMiddle::SetForwardSnrCallback (ForwardUpSnrCallback callback)
++{
++  NS_LOG_FUNCTION_NOARGS ();
++  m_snrCallback = callback;
++}
+ OriginatorRxStatus *
+ MacRxMiddle::Lookup (const WifiMacHeader *hdr)
+ {
+@@ -340,5 +345,47 @@ MacRxMiddle::Receive (Ptr<Packet> packet
+     }
+   m_callback (agregate, hdr);
+ }
+-
++ void
++ MacRxMiddle::SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr)
++ {
++   NS_LOG_FUNCTION (packet << hdr);
++   NS_ASSERT (hdr->IsData () || hdr->IsMgt ());
++   OriginatorRxStatus *originator = Lookup (hdr);
++   /**
++    * The check below is really uneeded because it can fail in a lot of
++    * normal cases. Specifically, it is possible for sequence numbers to
++    * loop back to zero once they reach 0xfff0 and to go up to 0xf7f0 in
++    * which case the check below will report the two sequence numbers to
++    * not have the correct order relationship.
++    * So, this check cannot be used to discard old duplicate frames. It is
++    * thus here only for documentation purposes.
++    */
++   if (!(SequenceNumber16 (originator->GetLastSequenceControl ()) < SequenceNumber16 (hdr->GetSequenceControl ())))
++     {
++       NS_LOG_DEBUG ("Sequence numbers have looped back. last recorded=" << originator->GetLastSequenceControl () <<
++                     " currently seen=" << hdr->GetSequenceControl ());
++     }
++   // filter duplicates.
++   if (IsDuplicate (hdr, originator))
++     {
++       NS_LOG_DEBUG ("duplicate from=" << hdr->GetAddr2 () <<
++                     ", seq=" << hdr->GetSequenceNumber () <<
++                     ", frag=" << hdr->GetFragmentNumber ());
++       return;
++     }
++   Ptr<Packet> agregate = HandleFragments (packet, hdr, originator);
++   if (agregate == 0)
++     {
++       return;
++     }
++   NS_LOG_DEBUG ("forwarding data from=" << hdr->GetAddr2 () <<
++                 ", seq=" << hdr->GetSequenceNumber () <<
++                 ", frag=" << hdr->GetFragmentNumber ());
++   if (!hdr->GetAddr1 ().IsGroup ())
++     {
++       originator->SetSequenceControl (hdr->GetSequenceControl ());
++     }
++   m_snrCallback (agregate, hdr, rxSnr);
++ }
++ 
+ } //namespace ns3
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.cc	2016-01-04 11:02:00.313191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.cc	2016-01-04 10:57:31.501191080 -0600
+@@ -26,6 +26,7 @@
+ #include "ns3/string.h"
+ #include "ns3/pointer.h"
+ #include "ns3/boolean.h"
++#include "ns3/enum.h"
+ #include "ns3/trace-source-accessor.h"
+ #include "qos-tag.h"
+ #include "mac-low.h"
+@@ -59,6 +60,48 @@ namespace ns3 {
+ 
+ NS_LOG_COMPONENT_DEFINE ("StaWifiMac");
+ 
++ class PhyStaMacListener : public ns3::WifiPhyListener
++ {
++ public:
++   PhyStaMacListener (ns3::StaWifiMac *staMac)
++     : m_staMac (staMac)
++   {
++   }
++   virtual ~PhyStaMacListener ()
++   {
++   }
++   virtual void NotifyRxStart (Time duration)
++   {
++   }
++   virtual void NotifyRxEndOk (void)
++   {
++   }
++   virtual void NotifyRxEndError (void)
++   {
++   }
++   virtual void NotifyTxStart (Time duration)
++   {
++   }
++   virtual void NotifyTxStart (Time duration, double txPowerDbm)
++   {
++   }
++   virtual void NotifySleep (void){
++   }
++   virtual void NotifyWakeup (void){
++   }
++   virtual void NotifyMaybeCcaBusyStart (Time duration)
++   {
++     m_staMac->NotifyCcaBusyOccurred ();
++   }
++   virtual void NotifySwitchingStart (Time duration)
++   {
++     m_staMac->NotifySwitchingStartNow (duration);
++   }
++ private:
++   ns3::StaWifiMac *m_staMac;
++ };
++ 
++
+ NS_OBJECT_ENSURE_REGISTERED (StaWifiMac);
+ 
+ TypeId
+@@ -91,6 +134,28 @@ StaWifiMac::GetTypeId (void)
+                    BooleanValue (false),
+                    MakeBooleanAccessor (&StaWifiMac::SetActiveProbing, &StaWifiMac::GetActiveProbing),
+                    MakeBooleanChecker ())
++     .AddAttribute ("ScanType",
++                    "The type of scanning for a BSS.",
++                    EnumValue (NOTSUPPORT),
++                    MakeEnumAccessor (&StaWifiMac::m_scanType), 
++                    MakeEnumChecker (NOTSUPPORT, "NotSupport",
++                             ACTIVE, "Active",
++                                     PASSIVE, "Passive"))
++     .AddAttribute ("MaxScanningChannelNumber",
++                    "Specifies maximum number of channels that are examined when scanning for a BSS.",
++                    UintegerValue (11),
++                    MakeUintegerAccessor (&StaWifiMac::m_maxChannelNumber), 
++                    MakeUintegerChecker<uint16_t> ())
++     .AddAttribute ("MaxChannelTime",
++                    "The maximum time to spend on each channel when scanning.",
++                    TimeValue (Seconds (0.05)),
++                    MakeTimeAccessor (&StaWifiMac::m_maxChannelTime), 
++                    MakeTimeChecker ())
++     .AddAttribute ("MinChannelTime",
++                    "The minimum time to spend on each channel when scanning.",
++                    TimeValue (Seconds (0.02)),
++                    MakeTimeAccessor (&StaWifiMac::m_minChannelTime), 
++                    MakeTimeChecker ())                   
+     .AddTraceSource ("Assoc", "Associated with an access point.",
+                      MakeTraceSourceAccessor (&StaWifiMac::m_assocLogger),
+                      "ns3::Mac48Address::TracedCallback")
+@@ -105,9 +170,20 @@ StaWifiMac::StaWifiMac ()
+   : m_state (BEACON_MISSED),
+     m_probeRequestEvent (),
+     m_assocRequestEvent (),
+-    m_beaconWatchdogEnd (Seconds (0.0))
++    m_beaconWatchdogEnd (Seconds (0.0)),
++    m_scanType (NOTSUPPORT),
++    m_maxChannelTime (Seconds (0.0)),
++    m_minChannelTime (Seconds (0.0)),
++    m_maxChannelNumber (0),
++    m_scanChannelNumber (0),
++    m_bCcaBusyOccurred (false),
++    m_scanResults (std::vector<ScanningEntry> ())    
+ {
+   NS_LOG_FUNCTION (this);
++  
++  m_rxMiddle->SetForwardSnrCallback (MakeCallback (&StaWifiMac::SnrReceive, this));
++  m_low->SetSnrRxCallback (MakeCallback (&MacRxMiddle::SnrReceive, m_rxMiddle));
++
+ 
+   //Let the lower layers know that we are acting as a non-AP STA in
+   //an infrastructure BSS.
+@@ -119,6 +195,22 @@ StaWifiMac::~StaWifiMac ()
+   NS_LOG_FUNCTION (this);
+ }
+ 
++
++  void
++ StaWifiMac::SetWifiPhy (Ptr<WifiPhy> phy)
++ {
++   RegularWifiMac::SetWifiPhy (phy);
++   SetupStaMacListener (phy);
++ }
++ 
++ void
++ StaWifiMac::DoDispose ()
++ {
++   RegularWifiMac::DoDispose ();
++   delete m_phyStaMacListener;
++   m_phyStaMacListener = NULL;
++ }
++ 
+ void
+ StaWifiMac::SetMaxMissedBeacons (uint32_t missed)
+ {
+@@ -289,6 +381,8 @@ StaWifiMac::TryToEnsureAssociated (void)
+          association with a given ssid.
+        */
+       break;
++    case SCANNING:
++      break;
+     }
+ }
+ 
+@@ -308,6 +402,29 @@ StaWifiMac::ProbeRequestTimeout (void)
+   SendProbeRequest ();
+ }
+ 
++ void
++ StaWifiMac::RunScanOrProbe (void)
++ {
++     NS_LOG_FUNCTION (this << GetBssid ());
++     if (IsSupportScanning())
++       {
++         if (m_state != SCANNING)
++         {
++           NS_LOG_DEBUG ("start scanning");
++           SetState (SCANNING);
++           ScanningStart ();
++         }
++       }
++     else
++       {
++         NS_LOG_DEBUG ("beacon missed");
++         SetState (BEACON_MISSED);
++         TryToEnsureAssociated ();
++       } 
++ }
++
++
++
+ void
+ StaWifiMac::MissedBeacons (void)
+ {
+@@ -322,9 +439,10 @@ StaWifiMac::MissedBeacons (void)
+                                               &StaWifiMac::MissedBeacons, this);
+       return;
+     }
+-  NS_LOG_DEBUG ("beacon missed");
+-  SetState (BEACON_MISSED);
+-  TryToEnsureAssociated ();
++//  NS_LOG_DEBUG ("beacon missed");
++//  SetState (BEACON_MISSED);
++//  TryToEnsureAssociated ();
++  RunScanOrProbe();
+ }
+ 
+ void
+@@ -359,7 +477,8 @@ StaWifiMac::Enqueue (Ptr<const Packet> p
+   if (!IsAssociated ())
+     {
+       NotifyTxDrop (packet);
+-      TryToEnsureAssociated ();
++//      TryToEnsureAssociated ();
++	  RunScanOrProbe();
+       return;
+     }
+   WifiMacHeader hdr;
+@@ -763,4 +882,183 @@ StaWifiMac::SetState (MacState value)
+   m_state = value;
+ }
+ 
++
++ void
++ StaWifiMac::SetupStaMacListener (Ptr<WifiPhy> phy)
++ {
++   m_phyStaMacListener = new PhyStaMacListener (this);
++   phy->RegisterListener (m_phyStaMacListener);
++ }
++ 
++ bool 
++ StaWifiMac::IsSupportScanning (void) const
++ {
++   return m_scanType != NOTSUPPORT;
++ }
++ 
++ void 
++ StaWifiMac::NotifySwitchingStartNow (Time duration)
++ {
++   Simulator::Schedule (duration,
++                        &StaWifiMac::ScanningSwitchChannelEnd, this);
++ }
++ 
++ void 
++ StaWifiMac:: NotifyCcaBusyOccurred ()
++ {
++   m_bCcaBusyOccurred = true;
++ }
++ 
++ void 
++ StaWifiMac::ScanningStart(void)
++ {
++   NS_LOG_FUNCTION (this);
++   m_probeRequestEvent.Cancel ();
++   m_beaconWatchdog.Cancel ();
++   m_scanChannelNumber = 0;
++   m_scanResults.clear ();
++   m_low->EnableForwardSnr (true);
++   m_bestAP = NULL;
++   Simulator::ScheduleNow (&StaWifiMac::ScanningSwitchChannelStart, this);
++ }
++ 
++ void 
++ StaWifiMac::ScanningEnd(void)
++ {
++   NS_LOG_FUNCTION (this);
++   m_low->EnableForwardSnr (false);
++ 
++   SetState (BEACON_MISSED);
++ 
++   uint32_t size = m_scanResults.size ();
++   if (size == 0)
++     {
++       NS_LOG_LOGIC ("cant scan for any ap.");
++       RunScanOrProbe ();
++     } 
++   else
++     {
++       NS_LOG_DEBUG ("scan result: number of aps is " << m_scanResults.size ());
++       m_bestAP = &m_scanResults[0];
++     
++      for (uint32_t i = 1; i < size; i++)
++        {
++          if (m_bestAP->rxSnr < m_scanResults[i].rxSnr)
++            {
++              m_bestAP = &m_scanResults[i];
++             }  
++         }
++       NS_LOG_DEBUG ("bestAP: " << m_bestAP->channelNumber << " " << m_bestAP->ssid << " " << m_bestAP->bssid);
++       m_phy->SetChannelNumber (m_bestAP->channelNumber);
++     }  
++ }
++ 
++ void
++ StaWifiMac::ScanningSwitchChannelStart(void)
++ {  
++   if (m_probeRequestEvent.IsRunning ())
++     {
++       m_probeRequestEvent.Cancel ();
++     }
++       
++   m_scanChannelNumber++;
++   NS_LOG_DEBUG ("switch to channel number:" << m_scanChannelNumber);
++   if(m_scanChannelNumber > m_maxChannelNumber)
++     {
++       ScanningEnd();
++     }
++   else
++     {
++       m_phy->SetChannelNumber (m_scanChannelNumber);
++     }
++ }
++ 
++ void
++ StaWifiMac::ScanningSwitchChannelEnd(void)
++ {
++     if (m_bestAP == NULL)
++       {
++         m_bCcaBusyOccurred = m_phy->IsStateCcaBusy ();
++   
++         if (m_scanType == ACTIVE)
++           {
++             SetSsid(Ssid());
++             SendProbeRequest();
++             m_scanChannelEvent = Simulator::Schedule (m_minChannelTime,
++                                  &StaWifiMac::ScanningMinChannelTimeout, this);
++           }
++         else if (m_scanType == PASSIVE)
++           {
++             m_scanChannelEvent = Simulator::Schedule (m_maxChannelTime,
++                                  &StaWifiMac::ScanningSwitchChannelStart, this);
++           }
++       }
++     else
++       {
++         SetSsid (m_bestAP->ssid);
++         SetState (WAIT_PROBE_RESP);
++         SendProbeRequest();          
++       } 
++ }
++ 
++ void 
++ StaWifiMac::ScanningMinChannelTimeout(void)
++ {
++   if (m_bCcaBusyOccurred && m_maxChannelTime > m_minChannelTime)
++     {
++       m_scanChannelEvent = Simulator::Schedule (m_maxChannelTime - m_minChannelTime,
++                            &StaWifiMac::ScanningSwitchChannelStart, this);
++     }
++   else
++     {
++       Simulator::ScheduleNow (&StaWifiMac::ScanningSwitchChannelStart, this);
++     }
++ }
++ 
++ void 
++ StaWifiMac::SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr)
++ {
++   NS_LOG_FUNCTION (this << packet << hdr << rxSnr << GetAddress () << hdr->GetAddr3 () << hdr->GetAddr1 ());
++   NS_ASSERT (!hdr->IsCtl ());
++   
++   ScanningEntry entry;
++   if (hdr->GetAddr3 () == GetAddress ())
++     {
++       NS_LOG_LOGIC ("packet sent by us.");
++       return;
++     }
++   else if (hdr->GetAddr1 () != GetAddress ())
++     {
++       NS_LOG_LOGIC ("packet is not for us");
++       NotifyRxDrop (packet);
++       return;
++     }
++    else if (hdr->IsBeacon ())
++     {
++       MgtBeaconHeader beacon;
++       packet->RemoveHeader (beacon);
++       
++       entry.ssid = beacon.GetSsid ();
++       
++     }
++   else if (hdr->IsProbeResp ())
++     {    
++         MgtProbeResponseHeader probeResp;
++         packet->RemoveHeader (probeResp);
++         
++         entry.ssid = probeResp.GetSsid ();        
++     }
++   else
++     {
++       NotifyRxDrop (packet);
++       return;
++     }
++     
++   entry.channelNumber = m_scanChannelNumber;
++   entry.bssid = hdr->GetAddr3 ();
++   entry.rxSnr = rxSnr;
++   m_scanResults.push_back (entry);
++ }
++ 
++
+ } //namespace ns3
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.h	2016-01-04 11:02:00.317191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/wifi/model/sta-wifi-mac.h	2016-01-04 10:37:20.353191080 -0600
+@@ -42,6 +42,27 @@ class MgtAddBaRequestHeader;
+ class StaWifiMac : public RegularWifiMac
+ {
+ public:
++
++
++   enum MacScanType
++   {
++     NOTSUPPORT,
++     ACTIVE,
++     PASSIVE
++   };
++ 
++   struct ScanningEntry
++   {
++     uint16_t channelNumber;
++     Ssid ssid;
++     Mac48Address bssid;
++     double rxSnr;
++   };
++   typedef Callback<void, std::vector<ScanningEntry> const & > ScanningCallback;
++ 
++
++
++
+   static TypeId GetTypeId (void);
+ 
+   StaWifiMac ();
+@@ -56,6 +77,11 @@ public:
+    * access is granted to this MAC.
+    */
+   virtual void Enqueue (Ptr<const Packet> packet, Mac48Address to);
++  
++  /**
++   * \param phy the physical layer attached to this MAC.
++   */
++  virtual void SetWifiPhy (Ptr<WifiPhy> phy);
+ 
+   /**
+    * \param missed the number of beacons which must be missed
+@@ -82,6 +108,23 @@ public:
+    */
+   void StartActiveAssociation (void);
+ 
++  /**
++   * \param duration switching delay duration.
++   *
++   * This method is typically invoked by the PhyMacLowListener to notify
++   * the MAC layer that a channel switching occured. When a channel switching
++   * occurs, pending MAC transmissions (RTS, CTS, DATA and ACK) are cancelled.
++   */
++  void NotifySwitchingStartNow (Time duration);
++  /**
++   * This method is typically invoked by the PhyMacLowListener to notify
++   * the MAC layer that CCA(Clear Channel Assessment) becomes busy
++   */
++  void NotifyCcaBusyOccurred ();
++
++protected:  
++  virtual void DoDispose ();
++
+ 
+ private:
+   /**
+@@ -93,7 +136,8 @@ private:
+     WAIT_PROBE_RESP,
+     WAIT_ASSOC_RESP,
+     BEACON_MISSED,
+-    REFUSED
++    REFUSED,
++    SCANNING
+   };
+ 
+   /**
+@@ -183,6 +227,20 @@ private:
+    * \return the HT capability that we support
+    */
+   HtCapabilities GetHtCapabilities (void) const;
++  
++  void SetupStaMacListener (Ptr<WifiPhy> phy);
++  bool IsSupportScanning (void) const;
++  void ScanningStart (void);
++  void ScanningEnd (void);
++  void ScanningSwitchChannelStart (void);
++  void ScanningSwitchChannelEnd (void);
++  void ScanningMinChannelTimeout (void);
++  virtual void SnrReceive (Ptr<Packet> packet, const WifiMacHeader *hdr, double rxSnr);
++  void RunScanOrProbe (void);
++  
++  
++  
++  
+   /**
+    * Return the VHT capability of the current STA.
+    *
+@@ -200,6 +258,20 @@ private:
+   uint32_t m_maxMissedBeacons;
+   bool m_activeProbing;
+ 
++  class PhyStaMacListener * m_phyStaMacListener;
++  MacScanType m_scanType;
++  Time m_maxChannelTime;
++  Time m_minChannelTime;
++  uint16_t m_maxChannelNumber;
++  uint16_t m_scanChannelNumber;
++  bool m_bCcaBusyOccurred;
++  std::vector<ScanningEntry> m_scanResults;
++  EventId m_scanChannelEvent;
++  ScanningEntry* m_bestAP;
++
++
++
++
+   TracedCallback<Mac48Address> m_assocLogger;
+   TracedCallback<Mac48Address> m_deAssocLogger;
+ };

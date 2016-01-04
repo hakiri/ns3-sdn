@@ -1,0 +1,48 @@
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/netanim/model/animation-interface.cc	2016-01-04 11:02:00.305191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/netanim/model/animation-interface.cc	2016-01-04 11:30:36.260423664 -0600
+@@ -1496,7 +1496,8 @@ AnimationInterface::GetPosition (Ptr <No
+ {
+   if (m_nodeLocation.find (n->GetId ()) == m_nodeLocation.end ())
+     {
+-      NS_FATAL_ERROR ("Node:" <<n->GetId () << " not found in Location table");
++      //NS_FATAL_ERROR ("Node:" <<n->GetId () << " not found in Location table");
++      m_nodeLocation[n->GetId ()] = Vector (0, 0, 0);
+     }  
+   return m_nodeLocation[n->GetId ()];
+ }
+@@ -1561,7 +1562,10 @@ AnimationInterface::WriteLinkProperties
+             }
+           std::string channelType = ch->GetInstanceTypeId ().GetName ();
+           NS_LOG_DEBUG ("Got ChannelType" << channelType);
+-          if (channelType == std::string ("ns3::PointToPointChannel"))
++          if (channelType == std::string ("ns3::PointToPointChannel") ||
++              channelType == std::string ("ns3::CsmaChannel") ||
++              channelType == std::string ("ns3::SimpleChannel"))                 
++          
+             { // Since these are duplex links, we only need to dump
+               // if srcid < dstid
+               uint32_t nChDev = ch->GetNDevices ();
+--- /home/sdn/ns-3-allinone/ns-3-dev/src/netanim/model/animation-interface.cc	2016-01-04 11:02:00.305191080 -0600
++++ /home/sdn/backup/ns-3-allinone/ns-3-dev/src/netanim/model/animation-interface.cc	2016-01-04 11:30:36.260423664 -0600
+@@ -1496,7 +1496,8 @@ AnimationInterface::GetPosition (Ptr <No
+ {
+   if (m_nodeLocation.find (n->GetId ()) == m_nodeLocation.end ())
+     {
+-      NS_FATAL_ERROR ("Node:" <<n->GetId () << " not found in Location table");
++      //NS_FATAL_ERROR ("Node:" <<n->GetId () << " not found in Location table");
++      m_nodeLocation[n->GetId ()] = Vector (0, 0, 0);
+     }  
+   return m_nodeLocation[n->GetId ()];
+ }
+@@ -1561,7 +1562,10 @@ AnimationInterface::WriteLinkProperties
+             }
+           std::string channelType = ch->GetInstanceTypeId ().GetName ();
+           NS_LOG_DEBUG ("Got ChannelType" << channelType);
+-          if (channelType == std::string ("ns3::PointToPointChannel"))
++          if (channelType == std::string ("ns3::PointToPointChannel") ||
++              channelType == std::string ("ns3::CsmaChannel") ||
++              channelType == std::string ("ns3::SimpleChannel"))                 
++          
+             { // Since these are duplex links, we only need to dump
+               // if srcid < dstid
+               uint32_t nChDev = ch->GetNDevices ();
