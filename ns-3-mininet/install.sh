@@ -18,6 +18,10 @@ DIST=Unknown
 RELEASE=Unknown
 CODENAME=Unknown
 CORE_VERSION='4.8'
+
+BUILD_DIR="$(pwd -P)"
+
+
 #function detect_env {
 	# Attempt to identify Linux release
 
@@ -304,11 +308,13 @@ function openvswitch {
 		#cd openvswitch-$OVS_VERSION
 	fi
 	
-	cd openvswitch-$OVS_VERSION
-	
+	cd openvswitch-$OVS_VERSION && mkdir build
+    DEB_BUILD_OPTIONS='parallel=2 nocheck' fakeroot debian/rules binary
+    dpkg -i $ROOT_PATH/openvswitch-switch_$OVS_VERSION*.deb $ROOT_PATH/openvswitch-common_$OVS_VERSION*.deb \
+            $ROOT_PATH/openvswitch-pki_$OVS_VERSION*.deb	
 	./boot.sh
-	#./configure
-	# make
+	./configure
+	 make
 	# build the kernel module
 	./configure --with-linux=/lib/modules/`uname -r`/build
 	make
@@ -330,9 +336,7 @@ function openvswitch {
 	
 	echo "Create Directory and openvswitch databse"
 	sudo touch /usr/local/etc/ovs-vswitchd.conf
-
-    sudo mkdir -p /usr/local/etc/openvswitch
-    
+    sudo mkdir -p /usr/local/etc/openvswitch  
 	sudo ovsdb-tool create /usr/local/etc/openvswitch/conf.db vswitchd/vswitch.ovsschema
 	
 	echo "Lunch database"
